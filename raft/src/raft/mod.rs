@@ -1,6 +1,7 @@
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
-use std::thread::{JoinHandle, Thread};
+use std::thread::JoinHandle;
+use std::time::Instant;
 
 use futures::channel::mpsc::UnboundedSender;
 use rand::Rng;
@@ -36,18 +37,18 @@ pub enum ApplyMsg {
 /// State of a raft peer.
 #[derive(Default, Clone, Debug)]
 pub struct State {
-    pub term: u64,
-    pub is_leader: bool,
+    pub term: Arc<Mutex<u64>>,
+    pub is_leader: Arc<Mutex<bool>>,
 }
 
 impl State {
     /// The current term of this peer.
     pub fn term(&self) -> u64 {
-        self.term
+        *self.term.lock().unwrap()
     }
     /// Whether this peer believes it is the leader.
     pub fn is_leader(&self) -> bool {
-        self.is_leader
+        *self.is_leader.lock().unwrap()
     }
 }
 
@@ -57,11 +58,11 @@ pub struct Raft {
     // RPC end points of all peers
     peers: Vec<RaftClient>,
     // Object to hold this peer's persisted state
-    persister: Box<dyn Persister>,
+    persister: Mutex<Box<dyn Persister>>,
     // this peer's index into peers[]
     me: usize,
     state: Arc<State>,
-    voted_for: Option<usize>,
+    voted_for: Arc<Mutex<i32>>,
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
@@ -87,10 +88,10 @@ impl Raft {
         // Your initialization code here (2A, 2B, 2C).
         let mut rf = Raft {
             peers,
-            persister,
+            persister: Mutex::new(persister),
             me,
             state: Arc::default(),
-            voted_for: None,
+            voted_for: Arc::new(Mutex::new(-1)),
         };
 
         // initialize from state persisted before a crash
@@ -212,13 +213,22 @@ impl Raft {
         crate::your_code_here((index, snapshot));
     }
 
-    pub fn send_heartbeat_handler(&self) {
+    pub fn send_heartbeat_handler(&self, index: usize) -> Receiver<Result<AppendEntriesReply>> {
+        // println!("Sending heartbeat to all peers from {:?}", self.me);
         let args = AppendEntriesArgs {
-            term: self.state.term,
+            term: *self.state.term.lock().unwrap(),
         };
-        for peer in self.peers.iter() {
-            let _ = peer.append_entries(&args);
-        }
+        // for peer in self.peers.iter() {
+        //     let _ = peer.append_entries(&args);
+        // }
+        let (tx, rx) = sync_channel::<Result<AppendEntriesReply>>(1);
+        let peer = &self.peers[index];
+        let peer_clone = peer.clone();
+        peer.spawn(async move {
+            let res = peer_clone.append_entries(&args).await.map_err(Error::Rpc);
+            tx.send(res);
+        });
+        rx
     }
 }
 
@@ -255,7 +265,7 @@ impl Raft {
 #[derive(Clone)]
 pub struct Node {
     // Your code here.
-    raft: Arc<Mutex<Raft>>,
+    raft: Arc<Raft>,
     timeout_handler: Arc<Mutex<Option<JoinHandle<()>>>>,
     recieved_heartbeat: Arc<Mutex<bool>>,
     // sender: SyncSender<bool>,
@@ -267,10 +277,11 @@ impl Node {
     pub fn new(raft: Raft) -> Node {
         // Your code here.
         let mut node = Node {
-            raft: Arc::new(Mutex::new(raft)),
+            raft: Arc::new(raft),
             timeout_handler: Arc::new(Mutex::new(None)),
             recieved_heartbeat: Arc::new(Mutex::new(false)),
         };
+        node.heartbeat_sender();
         node.timeout_handler();
         node
     }
@@ -294,10 +305,10 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.start(command)
-        if self.raft.lock().unwrap().state.is_leader {
+        if *self.raft.state.is_leader.lock().unwrap() {
             // If this node is the leader, start the command.
 
-            let res = self.raft.lock().unwrap().start(command);
+            let res = self.raft.start(command);
             res
         } else {
             // If this node is not the leader, return NotLeader error.
@@ -310,8 +321,8 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.term
-        println!("trying to hold the lock");
-        self.raft.lock().unwrap().state.term
+        // println!("trying to hold the lock");
+        *self.raft.state.term.lock().unwrap()
     }
 
     /// Whether this peer believes it is the leader.
@@ -319,14 +330,14 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.leader_id == self.id
-        self.raft.lock().unwrap().state.is_leader
+        *self.raft.state.is_leader.lock().unwrap()
     }
 
     /// The current state of this peer.
     pub fn get_state(&self) -> State {
         State {
-            term: self.term(),
-            is_leader: self.is_leader(),
+            term: Arc::new(Mutex::new(self.term())),
+            is_leader: Arc::new(Mutex::new(self.is_leader())),
         }
     }
 
@@ -374,52 +385,86 @@ impl Node {
         let recieved_heartbeat_clone = self.recieved_heartbeat.clone();
         let handler = std::thread::spawn(move || {
             let mut rnd = rand::thread_rng();
+            let mut time = Instant::now();
+            let mut rand_timeout = rnd.gen_range(150, 250);
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(rnd.gen_range(200, 401)));
-                if *recieved_heartbeat_clone.lock().unwrap() {
-                    *recieved_heartbeat_clone.lock().unwrap() = false;
+                // std::thread::sleep(std::time::Duration::from_millis(rnd.gen_range(150, 250)));
+                let elapsed = time.elapsed().as_millis();
+                if elapsed <= rand_timeout {
+                    if *recieved_heartbeat_clone.lock().unwrap() {
+                        *recieved_heartbeat_clone.lock().unwrap() = false;
+                        time = Instant::now();
+                        rand_timeout = rnd.gen_range(150, 250);
+                    }
                     continue;
                 }
-                if !raft_clone.lock().unwrap().state.is_leader {
-                    let current_term = raft_clone.lock().unwrap().state.term;
-                    raft_clone.lock().unwrap().state = Arc::new(State {
-                        term: current_term + 1,
-                        is_leader: false,
-                    });
-                    let args = RequestVoteArgs {
-                        current_term: raft_clone.lock().unwrap().state.term,
-                        current_index: 0, // This should be the index of the last log entry
-                        current_entry_hash: 0, // This should be the hash of the last log entry
-                        requesting_peer: raft_clone.lock().unwrap().me as u32,
-                    };
-                    let mut vec_rx = vec![];
-                    for i in 0..raft_clone.lock().unwrap().peers.len() {
-                        if i != raft_clone.lock().unwrap().me {
-                            let rx = raft_clone
-                                .lock()
-                                .unwrap()
-                                .send_request_vote(i, args.clone());
-                            vec_rx.push(rx);
+                if elapsed > rand_timeout {
+                    // if *recieved_heartbeat_clone.lock().unwrap() {
+                    //     *recieved_heartbeat_clone.lock().unwrap() = false;
+                    //     continue;
+                    // }
+                    if !*raft_clone.state.is_leader.lock().unwrap() {
+                        let current_term = *raft_clone.state.term.lock().unwrap();
+                        *raft_clone.state.is_leader.lock().unwrap() = false;
+                        *raft_clone.state.term.lock().unwrap() = current_term + 1;
+                        //  Arc::new(State {
+                        //     term: Arc::new(Mutex::new(current_term + 1)),
+                        //     is_leader: Arc::new(Mutex::new(false)),
+                        // });
+                        let args = RequestVoteArgs {
+                            current_term: *raft_clone.state.term.lock().unwrap(),
+                            current_index: 0, // This should be the index of the last log entry
+                            current_entry_hash: 0, // This should be the hash of the last log entry
+                            requesting_peer: raft_clone.me as u32,
+                        };
+                        let mut vec_rx = vec![];
+                        for i in 0..raft_clone.peers.len() {
+                            if i != raft_clone.me {
+                                let rx = raft_clone.send_request_vote(i, args.clone());
+                                vec_rx.push(rx);
+                            }
                         }
-                    }
-                    let mut total_positive_votes = 0;
-                    for rx in vec_rx {
-                        let value = rx.recv().unwrap();
-                        if value.is_ok() && value.unwrap().vote_value == 1 {
-                            total_positive_votes += 1;
+                        let mut total_positive_votes = 0;
+                        for rx in vec_rx {
+                            let value = rx.recv().unwrap();
+                            if value.is_ok() {
+                                total_positive_votes += value.unwrap().vote_value;
+                            }
                         }
-                    }
-                    if total_positive_votes > raft_clone.lock().unwrap().peers.len() / 2 {
-                        raft_clone.lock().unwrap().state = Arc::new(State {
-                            term: raft_clone.lock().unwrap().state.term,
-                            is_leader: true,
-                        });
-                        raft_clone.lock().unwrap().send_heartbeat_handler();
+                        if total_positive_votes as usize > raft_clone.peers.len() / 2 {
+                            *raft_clone.state.is_leader.lock().unwrap() = true;
+                            // raft_clone.send_heartbeat_handler();
+                        }
                     }
                 }
+                time = Instant::now();
+                rand_timeout = rnd.gen_range(150, 250);
             }
         });
         self.timeout_handler.lock().unwrap().replace(handler);
+    }
+
+    fn heartbeat_sender(&self) {
+        let raft_clone = self.raft.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if *raft_clone.state.is_leader.lock().unwrap() == false {
+                continue;
+            }
+            let mut rx_vec = vec![];
+            for i in 0..raft_clone.peers.len() {
+                if i != raft_clone.me {
+                    let rx = raft_clone.send_heartbeat_handler(i);
+                    rx_vec.push(rx);
+                }
+            }
+            for rx in rx_vec {
+                let value = rx.recv().unwrap();
+                if value.is_ok() && !value.unwrap().success {
+                    *raft_clone.state.is_leader.lock().unwrap() = false;
+                }
+            }
+        });
     }
 }
 
@@ -430,10 +475,9 @@ impl RaftService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
         // Your code here (2A, 2B).
-        if self.raft.lock().unwrap().voted_for.is_none()
-            && self.raft.lock().unwrap().state.term < args.current_term as u64
-        {
-            self.raft.lock().unwrap().voted_for = Some(args.requesting_peer as usize);
+        if *self.raft.voted_for.lock().unwrap() < args.current_term as i32 {
+            *self.raft.voted_for.lock().unwrap() = args.current_term as i32;
+            // *self.raft.state.term.lock().unwrap() = args.current_term as u64;
             return Ok(RequestVoteReply { vote_value: 1 });
         }
         return Ok(RequestVoteReply {
@@ -444,14 +488,16 @@ impl RaftService for Node {
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
         // Your code here (2A, 2B).
         // crate::your_code_here(args);
-        if args.term == self.raft.lock().unwrap().state.term {
+        // println!(
+        //     "AppendEntriesArgs: {:?} and node value is {}",
+        //     args, self.raft.me
+        // );
+        if args.term == *self.raft.state.term.lock().unwrap() {
             *self.recieved_heartbeat.lock().unwrap() = true;
             return Ok(AppendEntriesReply { success: true });
-        } else if args.term > self.raft.lock().unwrap().state.term {
-            self.raft.lock().unwrap().state = Arc::new(State {
-                term: args.term,
-                is_leader: false,
-            });
+        } else if args.term > *self.raft.state.term.lock().unwrap() {
+            *self.raft.state.term.lock().unwrap() = args.term;
+            *self.raft.state.is_leader.lock().unwrap() = false;
             *self.recieved_heartbeat.lock().unwrap() = true;
             return Ok(AppendEntriesReply { success: true });
         } else {

@@ -164,7 +164,7 @@ impl Config {
 
             for (i, connected) in self.connected.iter().enumerate() {
                 if *connected {
-                    println!("before the lock enforcement");
+                    // println!("before the lock enforcement");
                     let state = self.rafts.lock().unwrap()[i]
                         .as_ref()
                         .unwrap()
@@ -172,8 +172,9 @@ impl Config {
                         .clone();
                     let term = state.term();
                     let is_leader = state.is_leader();
-                    println!("after the lock enforcement");
+                    // println!("after the lock enforcement");
                     if is_leader {
+                        println!("server {} is leader for term {}", i, term);
                         leaders.entry(term).or_insert_with(Vec::new).push(i);
                     }
                 }

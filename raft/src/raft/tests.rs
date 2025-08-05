@@ -101,7 +101,8 @@ fn test_many_election_2a() {
     cfg.check_one_leader();
 
     let mut random = rand::thread_rng();
-    for _ in 0..iters {
+    println!("starting network failure simulation");
+    for i in 0..iters {
         // disconnect three nodes
         let i1 = random.gen::<usize>() % servers;
         let i2 = random.gen::<usize>() % servers;
@@ -112,13 +113,15 @@ fn test_many_election_2a() {
 
         // either the current leader should still be alive,
         // or the remaining four should elect a new one.
+        println!("disconnecting {} {} {}", i1, i2, i3);
         cfg.check_one_leader();
 
         cfg.connect(i1);
         cfg.connect(i2);
         cfg.connect(i3);
+        println!("simulation number is {}", i);
     }
-
+    println!("All nodes reconnected");
     cfg.check_one_leader();
 
     cfg.end();
