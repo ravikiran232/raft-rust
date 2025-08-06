@@ -63,6 +63,7 @@ pub struct Raft {
     me: usize,
     state: Arc<State>,
     voted_for: Arc<Mutex<i32>>,
+    last_term: Arc<Mutex<u32>>,
     // Your data here (2A, 2B, 2C).
     // Look at the paper's Figure 2 for a description of what
     // state a Raft server must maintain.
@@ -92,6 +93,7 @@ impl Raft {
             me,
             state: Arc::default(),
             voted_for: Arc::new(Mutex::new(-1)),
+            last_term: Arc::new(Mutex::new(0)),
         };
 
         // initialize from state persisted before a crash
@@ -276,11 +278,12 @@ impl Node {
     /// Create a new raft service.
     pub fn new(raft: Raft) -> Node {
         // Your code here.
-        let mut node = Node {
+        let node = Node {
             raft: Arc::new(raft),
             timeout_handler: Arc::new(Mutex::new(None)),
             recieved_heartbeat: Arc::new(Mutex::new(false)),
         };
+        info!("Node created with id: {}", node.raft.me);
         node.heartbeat_sender();
         node.timeout_handler();
         node
@@ -380,65 +383,60 @@ impl Node {
         crate::your_code_here((index, snapshot));
     }
 
-    fn timeout_handler(&mut self) {
+    fn timeout_handler(&self) {
         let raft_clone = self.raft.clone();
         let recieved_heartbeat_clone = self.recieved_heartbeat.clone();
         let handler = std::thread::spawn(move || {
             let mut rnd = rand::thread_rng();
-            let mut time = Instant::now();
-            let mut rand_timeout = rnd.gen_range(150, 250);
             loop {
-                // std::thread::sleep(std::time::Duration::from_millis(rnd.gen_range(150, 250)));
-                let elapsed = time.elapsed().as_millis();
-                if elapsed <= rand_timeout {
-                    if *recieved_heartbeat_clone.lock().unwrap() {
-                        *recieved_heartbeat_clone.lock().unwrap() = false;
-                        time = Instant::now();
-                        rand_timeout = rnd.gen_range(150, 250);
-                    }
+                std::thread::sleep(std::time::Duration::from_millis(rnd.gen_range(150, 301)));
+                if *recieved_heartbeat_clone.lock().unwrap() {
+                    // println!("Received heartbeat from leader, to {}", raft_clone.me);
+                    *recieved_heartbeat_clone.lock().unwrap() = false;
                     continue;
                 }
-                if elapsed > rand_timeout {
-                    // if *recieved_heartbeat_clone.lock().unwrap() {
-                    //     *recieved_heartbeat_clone.lock().unwrap() = false;
-                    //     continue;
-                    // }
-                    if !*raft_clone.state.is_leader.lock().unwrap() {
-                        let current_term = *raft_clone.state.term.lock().unwrap();
-                        *raft_clone.state.is_leader.lock().unwrap() = false;
-                        *raft_clone.state.term.lock().unwrap() = current_term + 1;
-                        //  Arc::new(State {
-                        //     term: Arc::new(Mutex::new(current_term + 1)),
-                        //     is_leader: Arc::new(Mutex::new(false)),
-                        // });
-                        let args = RequestVoteArgs {
-                            current_term: *raft_clone.state.term.lock().unwrap(),
-                            current_index: 0, // This should be the index of the last log entry
-                            current_entry_hash: 0, // This should be the hash of the last log entry
-                            requesting_peer: raft_clone.me as u32,
-                        };
-                        let mut vec_rx = vec![];
+                if !*raft_clone.state.is_leader.lock().unwrap() {
+                    // let current_term = *raft_clone.state.term.lock().unwrap();
+                    // *raft_clone.state.is_leader.lock().unwrap() = false;
+                    *raft_clone.state.term.lock().unwrap() += 1;
+                    //  Arc::new(State {
+                    //     term: Arc::new(Mutex::new(current_term + 1)),
+                    //     is_leader: Arc::new(Mutex::new(false)),
+                    // });
+                    let args = RequestVoteArgs {
+                        current_term: *raft_clone.state.term.lock().unwrap(),
+                        current_index: *raft_clone.last_term.lock().unwrap(), // This should be the index of the last log entry
+                        current_entry_hash: 0, // This should be the hash of the last log entry
+                        requesting_peer: raft_clone.me as u32,
+                    };
+                    let mut vec_rx = vec![];
+                    // *raft_clone.voted_for.lock().unwrap() = args.current_term as i32;
+                    for i in 0..raft_clone.peers.len() {
+                        if i != raft_clone.me {
+                            let rx = raft_clone.send_request_vote(i, args.clone());
+                            vec_rx.push(rx);
+                        }
+                    }
+                    let mut total_positive_votes = 1;
+                    for rx in vec_rx {
+                        let value = rx.recv().unwrap();
+                        if value.is_ok() {
+                            total_positive_votes += value.unwrap().vote_value;
+                        }
+                    }
+                    info!(
+                        "total_positive_votes: {} for {}",
+                        total_positive_votes, raft_clone.me
+                    );
+                    if total_positive_votes as usize > raft_clone.peers.len() / 2 {
+                        *raft_clone.state.is_leader.lock().unwrap() = true;
                         for i in 0..raft_clone.peers.len() {
                             if i != raft_clone.me {
-                                let rx = raft_clone.send_request_vote(i, args.clone());
-                                vec_rx.push(rx);
+                                let _ = raft_clone.send_heartbeat_handler(i);
                             }
-                        }
-                        let mut total_positive_votes = 0;
-                        for rx in vec_rx {
-                            let value = rx.recv().unwrap();
-                            if value.is_ok() {
-                                total_positive_votes += value.unwrap().vote_value;
-                            }
-                        }
-                        if total_positive_votes as usize > raft_clone.peers.len() / 2 {
-                            *raft_clone.state.is_leader.lock().unwrap() = true;
-                            // raft_clone.send_heartbeat_handler();
                         }
                     }
                 }
-                time = Instant::now();
-                rand_timeout = rnd.gen_range(150, 250);
             }
         });
         self.timeout_handler.lock().unwrap().replace(handler);
@@ -447,10 +445,15 @@ impl Node {
     fn heartbeat_sender(&self) {
         let raft_clone = self.raft.clone();
         std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::sleep(std::time::Duration::from_millis(15));
             if *raft_clone.state.is_leader.lock().unwrap() == false {
                 continue;
             }
+            // println!(
+            //     "Sending heartbeat from {},state {}",
+            //     raft_clone.me,
+            //     *raft_clone.state.is_leader.lock().unwrap()
+            // );
             let mut rx_vec = vec![];
             for i in 0..raft_clone.peers.len() {
                 if i != raft_clone.me {
@@ -458,9 +461,11 @@ impl Node {
                     rx_vec.push(rx);
                 }
             }
-            for rx in rx_vec {
+            for rx in &rx_vec {
                 let value = rx.recv().unwrap();
-                if value.is_ok() && !value.unwrap().success {
+                // println!("Recieved heartbeat reply {:?} for {}", value, raft_clone.me);
+                if value.is_ok() && !value.clone().unwrap().success {
+                    println!("append entries failed for {}", raft_clone.me);
                     *raft_clone.state.is_leader.lock().unwrap() = false;
                 }
             }
@@ -475,14 +480,22 @@ impl RaftService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
         // Your code here (2A, 2B).
-        if *self.raft.voted_for.lock().unwrap() < args.current_term as i32 {
-            *self.raft.voted_for.lock().unwrap() = args.current_term as i32;
-            // *self.raft.state.term.lock().unwrap() = args.current_term as u64;
-            return Ok(RequestVoteReply { vote_value: 1 });
+        // println!(
+        //     "reuesting vote for term {} from {}, voted_for: {}, current_term:{}",
+        //     args.current_term,
+        //     args.requesting_peer,
+        //     *self.raft.voted_for.lock().unwrap(),
+        //     args.current_term
+        // );
+        let mut term_lock = self.raft.state.term.lock().unwrap();
+        if *term_lock >= args.current_term as u64 {
+            return Ok(RequestVoteReply { vote_value: 0 });
         }
-        return Ok(RequestVoteReply {
-            vote_value: 0, // Vote denied
-        });
+        if *self.raft.last_term.lock().unwrap() > args.current_index {
+            return Ok(RequestVoteReply { vote_value: 0 });
+        }
+        *term_lock = args.current_term as u64;
+        return Ok(RequestVoteReply { vote_value: 1 });
     }
 
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
@@ -492,15 +505,21 @@ impl RaftService for Node {
         //     "AppendEntriesArgs: {:?} and node value is {}",
         //     args, self.raft.me
         // );
-        if args.term == *self.raft.state.term.lock().unwrap() {
+        let mut term_lock = self.raft.state.term.lock().unwrap();
+        if args.term >= *term_lock {
             *self.recieved_heartbeat.lock().unwrap() = true;
+            *term_lock = args.term;
+            *self.raft.last_term.lock().unwrap() = args.term as u32;
             return Ok(AppendEntriesReply { success: true });
-        } else if args.term > *self.raft.state.term.lock().unwrap() {
-            *self.raft.state.term.lock().unwrap() = args.term;
-            *self.raft.state.is_leader.lock().unwrap() = false;
-            *self.recieved_heartbeat.lock().unwrap() = true;
-            return Ok(AppendEntriesReply { success: true });
-        } else {
+        }
+        // else if args.term > *self.raft.state.term.lock().unwrap() {
+        //     *self.raft.state.term.lock().unwrap() = args.term;
+        //     *self.raft.state.is_leader.lock().unwrap() = false;
+        //     // *self.raft.voted_for.lock().unwrap() = None;
+        //     *self.recieved_heartbeat.lock().unwrap() = true;
+        //     return Ok(AppendEntriesReply { success: true });
+        // }
+        else {
             return Ok(AppendEntriesReply { success: false });
         }
     }
