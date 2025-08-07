@@ -4,6 +4,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use futures::channel::mpsc::UnboundedSender;
+use labrpc::Rpc;
 use rand::Rng;
 use std::sync::Mutex;
 
@@ -216,7 +217,7 @@ impl Raft {
     }
 
     pub fn send_heartbeat_handler(&self, index: usize) -> Receiver<Result<AppendEntriesReply>> {
-        // println!("Sending heartbeat to all peers from {:?}", self.me);
+        // //println!("Sending heartbeat to all peers from {:?}", self.me);
         let args = AppendEntriesArgs {
             term: *self.state.term.lock().unwrap(),
         };
@@ -270,8 +271,8 @@ pub struct Node {
     raft: Arc<Raft>,
     timeout_handler: Arc<Mutex<Option<JoinHandle<()>>>>,
     recieved_heartbeat: Arc<Mutex<bool>>,
-    // sender: SyncSender<bool>,
-    // reciever:Arc<Receiver<bool>>
+    kill_handlers: Arc<Mutex<bool>>,
+    heartbeat_sender: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl Node {
@@ -282,8 +283,10 @@ impl Node {
             raft: Arc::new(raft),
             timeout_handler: Arc::new(Mutex::new(None)),
             recieved_heartbeat: Arc::new(Mutex::new(false)),
+            kill_handlers: Arc::new(Mutex::new(false)),
+            heartbeat_sender: Arc::new(Mutex::new(None)),
         };
-        info!("Node created with id: {}", node.raft.me);
+        //println!("Node created with id: {}", node.raft.me);
         node.heartbeat_sender();
         node.timeout_handler();
         node
@@ -324,7 +327,7 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.term
-        // println!("trying to hold the lock");
+        // //println!("trying to hold the lock");
         *self.raft.state.term.lock().unwrap()
     }
 
@@ -354,6 +357,16 @@ impl Node {
     /// threads you generated with this Raft Node.
     pub fn kill(&self) {
         // Your code here, if desired.
+        *self.kill_handlers.lock().unwrap() = true;
+        let th = self.timeout_handler.lock().unwrap().take();
+        let hh = self.heartbeat_sender.lock().unwrap().take();
+        if let Some(timeout) = th {
+            timeout.join().unwrap();
+        }
+        if let Some(heartbeat) = hh {
+            heartbeat.join().unwrap();
+        }
+        //println!("Node {} killed", self.raft.me);
     }
 
     /// A service wants to switch to snapshot.  
@@ -386,23 +399,21 @@ impl Node {
     fn timeout_handler(&self) {
         let raft_clone = self.raft.clone();
         let recieved_heartbeat_clone = self.recieved_heartbeat.clone();
+        let kill_handlers_clone = self.kill_handlers.clone();
         let handler = std::thread::spawn(move || {
             let mut rnd = rand::thread_rng();
             loop {
+                if *kill_handlers_clone.lock().unwrap() {
+                    return;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(rnd.gen_range(150, 301)));
+                //println!("received heartbeat: {}", *recieved_heartbeat_clone.lock().unwrap());
                 if *recieved_heartbeat_clone.lock().unwrap() {
-                    // println!("Received heartbeat from leader, to {}", raft_clone.me);
                     *recieved_heartbeat_clone.lock().unwrap() = false;
                     continue;
                 }
                 if !*raft_clone.state.is_leader.lock().unwrap() {
-                    // let current_term = *raft_clone.state.term.lock().unwrap();
-                    // *raft_clone.state.is_leader.lock().unwrap() = false;
                     *raft_clone.state.term.lock().unwrap() += 1;
-                    //  Arc::new(State {
-                    //     term: Arc::new(Mutex::new(current_term + 1)),
-                    //     is_leader: Arc::new(Mutex::new(false)),
-                    // });
                     let args = RequestVoteArgs {
                         current_term: *raft_clone.state.term.lock().unwrap(),
                         current_index: *raft_clone.last_term.lock().unwrap(), // This should be the index of the last log entry
@@ -410,8 +421,10 @@ impl Node {
                         requesting_peer: raft_clone.me as u32,
                     };
                     let mut vec_rx = vec![];
-                    // *raft_clone.voted_for.lock().unwrap() = args.current_term as i32;
                     for i in 0..raft_clone.peers.len() {
+                        if *kill_handlers_clone.lock().unwrap() {
+                            return;
+                        }
                         if i != raft_clone.me {
                             let rx = raft_clone.send_request_vote(i, args.clone());
                             vec_rx.push(rx);
@@ -419,16 +432,27 @@ impl Node {
                     }
                     let mut total_positive_votes = 1;
                     for rx in vec_rx {
-                        let value = rx.recv().unwrap();
-                        if value.is_ok() {
-                            total_positive_votes += value.unwrap().vote_value;
+                        if *kill_handlers_clone.lock().unwrap() {
+                            return;
+                        }
+                        let rc_value = rx.recv_timeout(std::time::Duration::from_millis(150));
+                        if let Ok(value) = rc_value {
+                            if value.is_ok() {
+                                total_positive_votes += value.unwrap().vote_value;
+                            }
                         }
                     }
-                    info!(
-                        "total_positive_votes: {} for {}",
-                        total_positive_votes, raft_clone.me
-                    );
+                    //println!("total votes recieved: {}", total_positive_votes);
                     if total_positive_votes as usize > raft_clone.peers.len() / 2 {
+                        //println!(
+                        //     "Total votes: {}, so I am the leader {} for term {}",
+                        //     total_positive_votes,
+                        //     raft_clone.me,
+                        //     *raft_clone.state.term.lock().unwrap()
+                        // );
+                        if *kill_handlers_clone.lock().unwrap() {
+                            return;
+                        }
                         *raft_clone.state.is_leader.lock().unwrap() = true;
                         for i in 0..raft_clone.peers.len() {
                             if i != raft_clone.me {
@@ -444,32 +468,53 @@ impl Node {
 
     fn heartbeat_sender(&self) {
         let raft_clone = self.raft.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_millis(15));
+        let kill_handlers_clone = self.kill_handlers.clone();
+        let handle = std::thread::spawn(move || loop {
+            if *kill_handlers_clone.lock().unwrap() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
             if *raft_clone.state.is_leader.lock().unwrap() == false {
                 continue;
             }
-            // println!(
-            //     "Sending heartbeat from {},state {}",
-            //     raft_clone.me,
-            //     *raft_clone.state.is_leader.lock().unwrap()
-            // );
             let mut rx_vec = vec![];
             for i in 0..raft_clone.peers.len() {
+                if *kill_handlers_clone.lock().unwrap() {
+                    return;
+                }
                 if i != raft_clone.me {
                     let rx = raft_clone.send_heartbeat_handler(i);
                     rx_vec.push(rx);
                 }
             }
+            let mut rx_error_count = 0;
+            let mut index = 0;
             for rx in &rx_vec {
-                let value = rx.recv().unwrap();
-                // println!("Recieved heartbeat reply {:?} for {}", value, raft_clone.me);
-                if value.is_ok() && !value.clone().unwrap().success {
-                    println!("append entries failed for {}", raft_clone.me);
-                    *raft_clone.state.is_leader.lock().unwrap() = false;
+                if *kill_handlers_clone.lock().unwrap() {
+                    return;
                 }
+                let rc_value = rx.recv_timeout(std::time::Duration::from_millis(150));
+                if let Ok(value) = rc_value {
+                    if value.is_ok() && !value.clone().unwrap().success {
+                        //println!("append entries failed for {}", raft_clone.me);
+                        *raft_clone.state.is_leader.lock().unwrap() = false;
+                        *raft_clone.state.term.lock().unwrap() = value.clone().unwrap().term;
+                    } else if value.is_err() {
+                        //println!(
+                        //     "Recieved error for {}: {:?}, with index {}",
+                        //     raft_clone.me, value, index
+                        // );
+                        rx_error_count += 1;
+                    }
+                }
+                index += 1;
+            }
+            if rx_error_count == rx_vec.len() {
+                //println!("All append entries failed for {}", raft_clone.me);
+                *raft_clone.state.is_leader.lock().unwrap() = false;
             }
         });
+        self.heartbeat_sender.lock().unwrap().replace(handle);
     }
 }
 
@@ -480,20 +525,17 @@ impl RaftService for Node {
     // CAVEATS: Please avoid locking or sleeping here, it may jam the network.
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
         // Your code here (2A, 2B).
-        // println!(
-        //     "reuesting vote for term {} from {}, voted_for: {}, current_term:{}",
-        //     args.current_term,
-        //     args.requesting_peer,
-        //     *self.raft.voted_for.lock().unwrap(),
-        //     args.current_term
-        // );
         let mut term_lock = self.raft.state.term.lock().unwrap();
         if *term_lock >= args.current_term as u64 {
+            //println!(
+            //     "voten not granted for term {}, current term is {}",
+            //     args.current_term, *term_lock
+            // );
             return Ok(RequestVoteReply { vote_value: 0 });
         }
-        if *self.raft.last_term.lock().unwrap() > args.current_index {
-            return Ok(RequestVoteReply { vote_value: 0 });
-        }
+        // if *self.raft.last_term.lock().unwrap() > args.current_index {
+        //     return Ok(RequestVoteReply { vote_value: 0 });
+        // }
         *term_lock = args.current_term as u64;
         return Ok(RequestVoteReply { vote_value: 1 });
     }
@@ -501,26 +543,25 @@ impl RaftService for Node {
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
         // Your code here (2A, 2B).
         // crate::your_code_here(args);
-        // println!(
-        //     "AppendEntriesArgs: {:?} and node value is {}",
-        //     args, self.raft.me
-        // );
         let mut term_lock = self.raft.state.term.lock().unwrap();
         if args.term >= *term_lock {
             *self.recieved_heartbeat.lock().unwrap() = true;
             *term_lock = args.term;
+            *self.raft.state.is_leader.lock().unwrap() = false;
             *self.raft.last_term.lock().unwrap() = args.term as u32;
-            return Ok(AppendEntriesReply { success: true });
-        }
-        // else if args.term > *self.raft.state.term.lock().unwrap() {
-        //     *self.raft.state.term.lock().unwrap() = args.term;
-        //     *self.raft.state.is_leader.lock().unwrap() = false;
-        //     // *self.raft.voted_for.lock().unwrap() = None;
-        //     *self.recieved_heartbeat.lock().unwrap() = true;
-        //     return Ok(AppendEntriesReply { success: true });
-        // }
-        else {
-            return Ok(AppendEntriesReply { success: false });
+            return Ok(AppendEntriesReply {
+                success: true,
+                term: 0,
+            });
+        } else {
+            //println!(
+            //     "AppendEntriesArgs: {:?} and node value is {}, but term is not valid",
+            //     args, self.raft.me
+            // );
+            return Ok(AppendEntriesReply {
+                success: false,
+                term: *term_lock,
+            });
         }
     }
 }
