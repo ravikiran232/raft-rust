@@ -1,10 +1,8 @@
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Instant;
 
 use futures::channel::mpsc::UnboundedSender;
-use labrpc::Rpc;
 use rand::Rng;
 use std::sync::Mutex;
 
@@ -63,11 +61,10 @@ pub struct Raft {
     // this peer's index into peers[]
     me: usize,
     state: Arc<State>,
-    voted_for: Arc<Mutex<i32>>,
-    last_term: Arc<Mutex<u32>>,
-    // Your data here (2A, 2B, 2C).
-    // Look at the paper's Figure 2 for a description of what
-    // state a Raft server must maintain.
+    log_entries: Mutex<Vec<(u64, Vec<u8>)>>, // (term, command)
+                                             // Your data here (2A, 2B, 2C).
+                                             // Look at the paper's Figure 2 for a description of what
+                                             // state a Raft server must maintain.
 }
 
 impl Raft {
@@ -93,8 +90,7 @@ impl Raft {
             persister: Mutex::new(persister),
             me,
             state: Arc::default(),
-            voted_for: Arc::new(Mutex::new(-1)),
-            last_term: Arc::new(Mutex::new(0)),
+            log_entries: Mutex::new(vec![(0, vec![])]),
         };
 
         // initialize from state persisted before a crash
@@ -183,17 +179,50 @@ impl Raft {
         return rx;
     }
 
-    fn start<M>(&self, command: &M) -> Result<(u64, u64)>
+    fn start<M>(self: Arc<Self>, command: &M) -> Result<(u64, u64)>
     where
         M: labcodec::Message,
     {
-        let index = 0;
-        let term = 0;
+        let index = self.log_entries.lock().unwrap().len() as u64;
+        let term = *self.state.term.lock().unwrap();
         let is_leader = true;
         let mut buf = vec![];
         labcodec::encode(command, &mut buf).map_err(Error::Encode)?;
+        self.log_entries.lock().unwrap().push((term, buf));
         // Your code here (2B).
-
+        let self_clone = self.clone();
+        for peer in self_clone.peers.iter() {
+            let peer_clone = peer.clone();
+            let self_clone_move = self_clone.clone();
+            if *self_clone_move.state.is_leader.lock().unwrap() {
+                // If this node is not the leader, we don't need to send the command.
+                continue;
+            }
+            peer.spawn(async move {
+                let mut res = false;
+                let mut index = self_clone_move.log_entries.lock().unwrap().len() as u64 - 1;
+                println!("lock checkpoint0");
+                while !res {
+                    let prev_term = self_clone_move.log_entries.lock().unwrap()[index as usize].0;
+                    let args = AppendEntriesArgs {
+                        term: *self_clone_move.state.term.lock().unwrap(),
+                        prev_index: index,
+                        prev_term,
+                        entries: self_clone_move.create_entries(
+                            self_clone_move.log_entries.lock().unwrap().len() - index as usize,
+                        ),
+                    };
+                    let reply = peer_clone.append_entries(&args).await.map_err(Error::Rpc);
+                    if let Ok(reply) = reply {
+                        if reply.success {
+                            res = true;
+                        } else {
+                            index -= 1;
+                        }
+                    }
+                }
+            });
+        }
         if is_leader {
             Ok((index, term))
         } else {
@@ -220,6 +249,9 @@ impl Raft {
         // //println!("Sending heartbeat to all peers from {:?}", self.me);
         let args = AppendEntriesArgs {
             term: *self.state.term.lock().unwrap(),
+            prev_index: 0,
+            prev_term: 0,
+            entries: vec![], // No entries for heartbeat
         };
         // for peer in self.peers.iter() {
         //     let _ = peer.append_entries(&args);
@@ -233,13 +265,25 @@ impl Raft {
         });
         rx
     }
+
+    fn create_entries(&self, no_of_entries: usize) -> Vec<CommandEntry> {
+        let len_log = self.log_entries.lock().unwrap().len();
+
+        self.log_entries.lock().unwrap()[len_log - no_of_entries..len_log]
+            .iter()
+            .map(|entry| CommandEntry {
+                term: entry.0,
+                command: entry.1.iter().map(|&x| x.into()).collect(),
+            })
+            .collect()
+    }
 }
 
 impl Raft {
     /// Only for suppressing deadcode warnings.
     #[doc(hidden)]
     pub fn __suppress_deadcode(&mut self) {
-        let _ = self.start(&0);
+        // let _ = self.start(&0);
         let _ = self.cond_install_snapshot(0, 0, &[]);
         self.snapshot(0, &[]);
         let _ = self.send_request_vote(0, Default::default());
@@ -311,15 +355,10 @@ impl Node {
         // Your code here.
         // Example:
         // self.raft.start(command)
-        if *self.raft.state.is_leader.lock().unwrap() {
-            // If this node is the leader, start the command.
-
-            let res = self.raft.start(command);
-            res
-        } else {
-            // If this node is not the leader, return NotLeader error.
-            Err(Error::NotLeader)
-        }
+        // If this node is the leader, start the command.
+        let raft_clone = self.raft.clone();
+        let res = raft_clone.start(command);
+        res
     }
 
     /// The current term of this peer.
@@ -407,17 +446,17 @@ impl Node {
                     return;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(rnd.gen_range(150, 301)));
-                //println!("received heartbeat: {}", *recieved_heartbeat_clone.lock().unwrap());
                 if *recieved_heartbeat_clone.lock().unwrap() {
                     *recieved_heartbeat_clone.lock().unwrap() = false;
                     continue;
                 }
                 if !*raft_clone.state.is_leader.lock().unwrap() {
                     *raft_clone.state.term.lock().unwrap() += 1;
+                    let log_lock = raft_clone.log_entries.lock().unwrap();
                     let args = RequestVoteArgs {
                         current_term: *raft_clone.state.term.lock().unwrap(),
-                        current_index: *raft_clone.last_term.lock().unwrap(), // This should be the index of the last log entry
-                        current_entry_hash: 0, // This should be the hash of the last log entry
+                        current_index: log_lock.len() as u32 - 1,
+                        current_entry_hash: log_lock.last().unwrap_or(&(0, vec![])).0 as u32, // This should be the hash of the last log entry
                         requesting_peer: raft_clone.me as u32,
                     };
                     let mut vec_rx = vec![];
@@ -442,14 +481,7 @@ impl Node {
                             }
                         }
                     }
-                    //println!("total votes recieved: {}", total_positive_votes);
                     if total_positive_votes as usize > raft_clone.peers.len() / 2 {
-                        //println!(
-                        //     "Total votes: {}, so I am the leader {} for term {}",
-                        //     total_positive_votes,
-                        //     raft_clone.me,
-                        //     *raft_clone.state.term.lock().unwrap()
-                        // );
                         if *kill_handlers_clone.lock().unwrap() {
                             return;
                         }
@@ -488,7 +520,6 @@ impl Node {
                 }
             }
             let mut rx_error_count = 0;
-            let mut index = 0;
             for rx in &rx_vec {
                 if *kill_handlers_clone.lock().unwrap() {
                     return;
@@ -496,21 +527,14 @@ impl Node {
                 let rc_value = rx.recv_timeout(std::time::Duration::from_millis(150));
                 if let Ok(value) = rc_value {
                     if value.is_ok() && !value.clone().unwrap().success {
-                        //println!("append entries failed for {}", raft_clone.me);
                         *raft_clone.state.is_leader.lock().unwrap() = false;
                         *raft_clone.state.term.lock().unwrap() = value.clone().unwrap().term;
                     } else if value.is_err() {
-                        //println!(
-                        //     "Recieved error for {}: {:?}, with index {}",
-                        //     raft_clone.me, value, index
-                        // );
                         rx_error_count += 1;
                     }
                 }
-                index += 1;
             }
             if rx_error_count == rx_vec.len() {
-                //println!("All append entries failed for {}", raft_clone.me);
                 *raft_clone.state.is_leader.lock().unwrap() = false;
             }
         });
@@ -526,16 +550,25 @@ impl RaftService for Node {
     async fn request_vote(&self, args: RequestVoteArgs) -> labrpc::Result<RequestVoteReply> {
         // Your code here (2A, 2B).
         let mut term_lock = self.raft.state.term.lock().unwrap();
+        let last_term_inlog = self
+            .raft
+            .log_entries
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap_or(&(0, vec![]))
+            .0 as u32;
         if *term_lock >= args.current_term as u64 {
-            //println!(
-            //     "voten not granted for term {}, current term is {}",
-            //     args.current_term, *term_lock
-            // );
             return Ok(RequestVoteReply { vote_value: 0 });
         }
-        // if *self.raft.last_term.lock().unwrap() > args.current_index {
-        //     return Ok(RequestVoteReply { vote_value: 0 });
-        // }
+        if args.current_entry_hash < last_term_inlog {
+            return Ok(RequestVoteReply { vote_value: 0 });
+        }
+        if args.current_entry_hash == last_term_inlog
+            && args.current_index < self.raft.log_entries.lock().unwrap().len() as u32 - 1
+        {
+            return Ok(RequestVoteReply { vote_value: 0 });
+        }
         *term_lock = args.current_term as u64;
         return Ok(RequestVoteReply { vote_value: 1 });
     }
@@ -543,21 +576,51 @@ impl RaftService for Node {
     async fn append_entries(&self, args: AppendEntriesArgs) -> labrpc::Result<AppendEntriesReply> {
         // Your code here (2A, 2B).
         // crate::your_code_here(args);
+        println!("lock checkpoint1");
         let mut term_lock = self.raft.state.term.lock().unwrap();
         if args.term >= *term_lock {
+            println!("lock checkpoint misc1");
             *self.recieved_heartbeat.lock().unwrap() = true;
+            println!("lock checkpoint misc1.1");
             *term_lock = args.term;
+            println!("lock checkpoint misc2");
             *self.raft.state.is_leader.lock().unwrap() = false;
-            *self.raft.last_term.lock().unwrap() = args.term as u32;
+            println!("lock checkpoint2");
+            if !args.entries.is_empty() {
+                let last_index = self.raft.log_entries.lock().unwrap().len() as u64 - 1;
+                let term_to_compare = self
+                    .raft
+                    .log_entries
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap_or(&(0, vec![]))
+                    .0;
+                println!("lock checkpoint3");
+                if args.prev_index > last_index || args.prev_term != term_to_compare {
+                    return Ok(AppendEntriesReply {
+                        success: false,
+                        term: *term_lock,
+                    });
+                }
+                println!("lock checkpoint4");
+                // remove the entries that are after the prev_index
+                self.raft
+                    .log_entries
+                    .lock()
+                    .unwrap()
+                    .truncate(args.prev_index as usize + 1);
+                let mut log_lock = self.raft.log_entries.lock().unwrap();
+                for entry in args.entries.iter() {
+                    log_lock.push((entry.term, entry.command.iter().map(|&x| x as u8).collect()));
+                }
+                println!("lock checkpoint5");
+            }
             return Ok(AppendEntriesReply {
                 success: true,
                 term: 0,
             });
         } else {
-            //println!(
-            //     "AppendEntriesArgs: {:?} and node value is {}, but term is not valid",
-            //     args, self.raft.me
-            // );
             return Ok(AppendEntriesReply {
                 success: false,
                 term: *term_lock,

@@ -36,16 +36,12 @@ fn test_initial_election_2a() {
 
     // sleep a bit to avoid racing with followers learning of the
     // election, then check that all peers agree on the term.
-    println!("first checkpoint");
     thread::sleep(Duration::from_millis(50));
     let term1 = cfg.check_terms();
-    println!("second checkpoint");
 
     // does the leader+term stay the same if there is no network failure?
     thread::sleep(2 * RAFT_ELECTION_TIMEOUT);
-    println!("third checkpoint");
     let term2 = cfg.check_terms();
-    println!("fourth checkpoint");
     if term1 != term2 {
         warn!("warning: term changed even though there were no failures")
     }
@@ -97,11 +93,12 @@ fn test_many_election_2a() {
     let mut cfg = Config::new(servers);
 
     cfg.begin("Test (2A): multiple elections");
-
+    println!("checkpoint for multiple elections");
     cfg.check_one_leader();
+    println!("checkpoint 2");
 
     let mut random = rand::thread_rng();
-    for i in 0..iters {
+    for _ in 0..iters {
         // disconnect three nodes
         let i1 = random.gen::<usize>() % servers;
         let i2 = random.gen::<usize>() % servers;
@@ -110,18 +107,20 @@ fn test_many_election_2a() {
         cfg.disconnect(i2);
         cfg.disconnect(i3);
 
+        println!("checkpoint 3");
         // either the current leader should still be alive,
         // or the remaining four should elect a new one.
-        info!("disconnecting {} {} {}", i1, i2, i3);
         cfg.check_one_leader();
 
+        println!("checkpoint 4");
         cfg.connect(i1);
         cfg.connect(i2);
         cfg.connect(i3);
-        info!("simulation number is {}", i);
+
+        println!("checkpoint 5");
     }
-    info!("All nodes reconnected");
     cfg.check_one_leader();
+    println!("checkpoint 6");
 
     cfg.end();
 }

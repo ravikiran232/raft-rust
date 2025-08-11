@@ -172,7 +172,6 @@ impl Config {
                     let term = state.term();
                     let is_leader = state.is_leader();
                     if is_leader {
-                        println!("server {} is leader for term {}", i, term);
                         leaders.entry(term).or_insert_with(Vec::new).push(i);
                     }
                 }
