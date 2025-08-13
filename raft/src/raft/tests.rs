@@ -383,8 +383,9 @@ fn test_backup_2b() {
     cfg.begin("Test (2B): leader backs up quickly over incorrect follower logs");
 
     let mut random = rand::thread_rng();
+    println!("checkpoint 1");
     cfg.one(random_entry(&mut random), servers, true);
-
+    println!("checkpoint 1 --complete");
     // put leader and one follower in a partition
     let leader1 = cfg.check_one_leader();
     cfg.disconnect((leader1 + 2) % servers);
@@ -410,8 +411,10 @@ fn test_backup_2b() {
     cfg.connect((leader1 + 4) % servers);
 
     // lots of successful commands to new group.
-    for _i in 0..50 {
+    for i in 0..50 {
+        println!("checkpoint 2 --{},start", i);
         cfg.one(random_entry(&mut random), 3, true);
+        println!("checkpoint 2 --{},completed",i);
     }
 
     // now another partitioned leader and one follower
@@ -443,6 +446,7 @@ fn test_backup_2b() {
     // lots of successful commands to new group.
     for _i in 0..50 {
         cfg.one(random_entry(&mut random), 3, true);
+    println!("checkpoint 3 --{}",_i);
     }
 
     // now everyone
@@ -450,6 +454,7 @@ fn test_backup_2b() {
         cfg.connect(i);
     }
     cfg.one(random_entry(&mut random), servers, true);
+    println!("checkpoint 4");
 
     cfg.end();
 }

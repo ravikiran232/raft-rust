@@ -303,14 +303,17 @@ impl Config {
             }
 
             if let Some(index) = index {
+                // println!("entered into second part");
                 // somebody claimed to be the leader and to have
                 // submitted our command; wait a while for agreement.
                 let t1 = Instant::now();
                 while t1.elapsed() < Duration::from_secs(2) {
                     let (nd, cmd1) = self.n_committed(index);
+                    // println!("total commits are {:?}, and cmd is {:?}", nd, cmd1);
                     if nd > 0 && nd >= expected_servers {
                         // committed
                         if let Some(cmd2) = cmd1 {
+                            println!("got the command {:?} and required command {:?}", cmd2, cmd);
                             if cmd2 == cmd {
                                 // and it was the command we submitted.
                                 return index;
