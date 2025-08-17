@@ -131,7 +131,7 @@ fn test_basic_agree_2b() {
     let mut cfg = Config::new(servers);
     cfg.begin("Test (2B): basic agreement");
 
-    let iters = 3;
+    let iters = 100;
     for index in 1..=iters {
         let (nd, _) = cfg.n_committed(index);
         if nd > 0 {
@@ -398,6 +398,7 @@ fn test_backup_2b() {
             .as_ref()
             .unwrap()
             .start(&random_entry(&mut random));
+        println!("completed normal check {}", _i);
     }
 
     thread::sleep(RAFT_ELECTION_TIMEOUT / 2);
@@ -414,7 +415,7 @@ fn test_backup_2b() {
     for i in 0..50 {
         println!("checkpoint 2 --{},start", i);
         cfg.one(random_entry(&mut random), 3, true);
-        println!("checkpoint 2 --{},completed",i);
+        println!("checkpoint 2 --{},completed", i);
     }
 
     // now another partitioned leader and one follower
@@ -446,7 +447,7 @@ fn test_backup_2b() {
     // lots of successful commands to new group.
     for _i in 0..50 {
         cfg.one(random_entry(&mut random), 3, true);
-    println!("checkpoint 3 --{}",_i);
+        println!("checkpoint 3 --{}", _i);
     }
 
     // now everyone
